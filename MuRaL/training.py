@@ -5,6 +5,9 @@ warnings.filterwarnings('ignore',category=FutureWarning)
 from pybedtools import BedTool
 
 import sys
+sys.path.append('/public/home/songhui/project/Mural/Mural_repo/MuRaL_112/model_utils')
+from Unets import Puffin_D
+
 import argparse
 import pandas as pd
 import numpy as np
@@ -38,8 +41,11 @@ from MuRaL.nn_utils import *
 from MuRaL.evaluation import *
 from MuRaL.custom_dataloader import MyDataLoader
 from MuRaL.preprocessing import *
+from MuRaL.evaluation import *
 
-
+from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn, get_kl_loss
+from bayesian_torch.ao.quantization.quantize import enable_prepare, convert
+from bayesian_torch.models.bnn_to_qbnn import bnn_to_qbnn
 
 #from torchsampler import ImbalancedDatasetSampler
 def train(config, args, checkpoint_dir=None):
@@ -115,7 +121,7 @@ def train(config, args, checkpoint_dir=None):
     custom_dataloader = args.custom_dataloader
     segment_workers = cpu_per_trial - 1
     print("Extral cpu used dataloadr: ", segment_workers)
-
+    mix_loss = args.mix_loss
 
     start_time = time.time()
 
@@ -280,11 +286,41 @@ def train(config, args, checkpoint_dir=None):
         # Combined model
         model = Network3(emb_dims, no_of_cont=n_cont, lin_layer_sizes=[config['local_hidden1_size'], config['local_hidden2_size']], emb_dropout=config['emb_dropout'], lin_layer_dropouts=[config['local_dropout'], config['local_dropout']], in_channels=in_channels, out_channels=config['CNN_out_channels'], kernel_size=config['CNN_kernel_size'], distal_radius=config['distal_radius'], distal_order=distal_order, distal_fc_dropout=config['distal_fc_dropout'], n_class=n_class, emb_padding_idx=4**config['local_order'])
         
+    elif model_no == 4:
+        model = Puffin_D(emb_dims, no_of_cont=0, lin_layer_sizes=[config['local_hidden1_size'], config['local_hidden2_size']],
+                  emb_dropout=config['emb_dropout'], lin_layer_dropouts=[config['local_dropout'], config['local_dropout']],
+                  in_channels=4, out_channels=config['CNN_out_channels'], kernel_size=config['CNN_kernel_size'],
+                  distal_radius=config['distal_radius'], distal_order=distal_order,
+                  distal_fc_dropout=config['distal_fc_dropout'], n_class=n_class, emb_padding_idx=4**config['local_order'])
 
     else:
         print('Error: no model selected!')
         sys.exit() 
     
+    moped_enable = False
+    if len(args.moped_init_model) > 0:  # use moped method if trained dnn model weights are provided
+        moped_enable = True
+
+    ##Set bnn parameters  
+    const_bnn_prior_parameters = {
+        "prior_mu": 0.0,
+        "prior_sigma": 1.0,
+        "posterior_mu_init": 0.0,
+        "posterior_rho_init": -3.0,
+        "type": "Flipout" if args.use_flipout_layers else "Reparameterization",  # Flipout or Reparameterization
+        "moped_enable": moped_enable,  # initialize mu/sigma from the dnn weights
+        "moped_delta": 0.5,
+    }
+
+    if moped_enable:
+        checkpoint = torch.load(args.moped_init_model, map_location=device)
+        if "state_dict" in checkpoint.keys():
+            model.load_state_dict(checkpoint["state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
+    
+    dnn_to_bnn(model, const_bnn_prior_parameters)  # only replaces linear and conv layers
+
     model.to(device)
     # Count the parameters in the model
     total_params = count_parameters(model)
@@ -330,12 +366,22 @@ def train(config, args, checkpoint_dir=None):
             # Re-initialize fc layers
             model.local_fc[-1].apply(weights_init)
             model.distal_fc[-1].apply(weights_init)    
-    else:
+    # else:
         # Initiating weights of the models;
-        model.apply(weights_init)
+        # model.apply(weights_init)
     
     # Set loss function
     criterion = torch.nn.CrossEntropyLoss(reduction='sum')
+    if mix_loss == 1:
+        combined_loss = combined_mse_loss
+    elif mix_loss == 2:
+        combined_loss = combined_avg_mut_mse_loss
+    elif mix_loss == 3:
+        combined_loss = combined_mse_loss_10mult
+    elif mix_loss == 4:
+        combined_loss = combined_mse_loss_200mult
+    elif mix_loss == 5:
+        combined_loss = combined_mse_loss_100mult
     #weights = torch.tensor([0.00515898, 0.44976093, 0.23657462, 0.30850547]).to(device)
     #weights = torch.tensor([0.00378079, 0.42361806, 0.11523816, 0.45736299]).to(device)
     #criterion = torch.nn.CrossEntropyLoss(weight=weights, reduction='sum')
@@ -402,6 +448,8 @@ def train(config, args, checkpoint_dir=None):
 
         model.train()
         total_loss = 0
+        total_loss1 = 0
+        total_loss2 = 0
         batch_count = 0
         
         if epoch > 0 and config['lr_scheduler'] == 'StepLR2':
@@ -430,10 +478,18 @@ def train(config, args, checkpoint_dir=None):
             cont_x = cont_x.to(device)
             distal_x = distal_x.to(device)
             y  = y.to(device)
-
-            # Forward Pass
-            preds = model.forward((cont_x, cat_x), distal_x)
-            loss = criterion(preds, y.long().squeeze())
+            output_ = []
+            kl_ = []
+            for mc_run in range(int(args.num_monte_carlo)):
+                output = model.forward((cont_x, cat_x), distal_x)
+                kl = get_kl_loss(model)
+                output_.append(output)
+                kl_.append(kl)
+            output = torch.mean(torch.stack(output_), dim=0)
+            kl = torch.mean(torch.stack(kl_), dim=0)
+            ce_loss = criterion(output, y.long().squeeze())
+            loss = ce_loss + (kl / config['batch_size'])
+                   
             optimizer.zero_grad()
             loss.backward()
             # time view
@@ -474,12 +530,17 @@ def train(config, args, checkpoint_dir=None):
                 #print('F.softmax(model.models_w):', F.softmax(model.models_w, dim=0))
                 #print('model.conv1[0].weight.grad:', model.conv1[0].weight.grad)
             #print('model.conv1.0.weight.grad:', model.conv1.0.weight)
+                
+            valid_pred_y, valid_pred_y_std, valid_total_loss = model_predict_m(model, dataloader_valid, criterion, device, n_class, num_monte_carlo, distal=True)
 
-            valid_pred_y, valid_total_loss = model_predict_m(model, dataloader_valid, criterion, device, n_class, distal=True)
-
-            valid_y_prob = pd.DataFrame(data=to_np(F.softmax(valid_pred_y, dim=1)), columns=prob_names)
+            # valid_y_prob = pd.DataFrame(data=to_np(F.softmax(valid_pred_y, dim=1)), columns=prob_names)
+            valid_y_prob = pd.DataFrame(data=to_np(valid_pred_y), columns=prob_names)
             
-            valid_data_and_prob = pd.concat([data_local_valid, valid_y_prob], axis=1)
+            if not valid_file:
+                valid_data_and_prob = pd.concat([data_local.iloc[dataset_valid.indices, ].reset_index(drop=True), valid_y_prob], axis=1)
+                
+            else:
+                valid_data_and_prob = pd.concat([data_local_valid, valid_y_prob], axis=1)
             
             valid_y = valid_data_and_prob['mut_type'].to_numpy().squeeze()
             
@@ -498,7 +559,10 @@ def train(config, args, checkpoint_dir=None):
             print('5mer correlation - all: ', freq_kmer_comp_multi(valid_data_and_prob, 5, n_class))
             print('7mer correlation - all: ', freq_kmer_comp_multi(valid_data_and_prob, 7, n_class))
             
-            print ('Training Loss: ', total_loss/train_size)
+            if mix_loss:
+                print(f"Training Loss: {total_loss/train_size}; CrossEntropyLoss: {total_loss1/train_size}; MSELOSS: {total_loss2/train_size}")
+            else:
+                print ('Training Loss: ', total_loss/train_size)
             
             print ('Validation Loss: ', valid_total_loss/valid_size)
             print ('Validation Loss (after fdiri_cal): ', fdiri_nll)
@@ -573,7 +637,7 @@ def train(config, args, checkpoint_dir=None):
             if not use_ray:
                 # Define a directory to save the files when not using Ray
                 #non_ray_checkpoint_dir = f'results/{args.experiment_name}/check_point{epoch}'
-                non_ray_checkpoint_dir = f'{trial_dir}/check_point{epoch}'
+                non_ray_checkpoint_dir = f'{trial_dir}/checkpoint_{epoch}'
                 os.makedirs(non_ray_checkpoint_dir, exist_ok=True)
                 path = os.path.join(non_ray_checkpoint_dir, 'model')
                 save_model_and_files(model, fdiri_cal, config, valid_pred_df, path, save_valid_preds)
