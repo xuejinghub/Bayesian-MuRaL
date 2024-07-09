@@ -123,6 +123,12 @@ def train(config, args, checkpoint_dir=None):
     print("Extral cpu used dataloadr: ", segment_workers)
     mix_loss = args.mix_loss
 
+    ##Bayesian Deeplearning Network Parameters
+    num_monte_carlo = args.num_monte_carlo
+    use_flipout_layers = args.use_flipout_layers
+    moped_delta_factor = args.moped_delta_factor
+    moped_init_model = args.moped_init_model
+
     start_time = time.time()
 
     if cudnn_benchmark_false:

@@ -68,10 +68,8 @@ def model_predict_m(model, dataloader, criterion, device, n_class, num_monte_car
 
             pred_results = torch.stack(pred_results)
             output_mc = torch.stack(output_mc)
-            print(output_mc)
             means = output_mc.mean(axis=0)
             stds = output_mc.std(axis=0)
-            print(stds)
 
             pred_y = torch.cat((pred_y, means), dim=0)
             pred_y_std = torch.cat((pred_y_std, stds), dim=0)
